@@ -1,91 +1,112 @@
 /**
- * Fetches all traffic camera data from the GDOT ArcGIS REST API.
+ * Fetches all 511GA / GDOT traffic cameras.
  *
- * The API paginates at 2000 records, so we loop with `resultOffset`
- * until all features are retrieved.
+ * 511GA exposes camera metadata through its DataTables endpoint and HLS URLs
+ * through short-lived shared stream-manager tokens. The registry cache for
+ * this adapter must stay short or clients will receive expired HLS URLs.
  */
 
-const GDOT_BASE =
-    "https://services1.arcgis.com/2iUE8l8JKrP2tygQ/arcgis/rest/services" +
-    "/GDOT_Live_Traffic_Cameras/FeatureServer/0/query";
+import type { CameraFeature } from "../adapters/types";
+import {
+    GDOT_BASE_URL,
+    GDOT_PAGE_SIZE,
+    type GdotCameraFeature,
+    type GdotCameraView,
+    type RawGdotCameraRow,
+} from "./gdotTypes";
+import { resolveSharedAuthSuffix } from "./gdotAuth";
+import { fetchGdotJson } from "./gdotHttp";
 
-const PAGE_SIZE = 2000;
+export type { GdotCameraFeature };
 
-export interface GdotCameraFeature {
-    type: "Feature";
-    geometry: { type: "Point"; coordinates: [number, number] };
-    properties: {
-        stream: string;
-        hls: string | null;
-        country: string;
-        region: string;
-        city: string;
-        source: string;
-        name: string;
-        route: string;
-        direction: string;
-        location_description: string;
-        categories: string[];
+function cameraListUrl(start: number): string {
+    const query = {
+        columns: [{ name: "sortOrder" }, { name: "roadway", s: true }, { data: "", name: "" }],
+        order: [{ column: 0, dir: "asc" }, { column: 1, dir: "asc" }],
+        start,
+        length: GDOT_PAGE_SIZE,
+        search: { value: "" },
     };
+    const params = new URLSearchParams({ query: JSON.stringify(query), lang: "en" });
+    return `${GDOT_BASE_URL}/List/GetData/Cameras?${params}`;
 }
 
-/** Convert a raw ArcGIS feature into our GeoJSON format. */
-function toGeoJsonFeature(raw: any): GdotCameraFeature | null {
-    const { attributes: a, geometry: g } = raw;
-    if (!g?.x || !g?.y) return null;
+function parsePoint(wkt?: string | null): [number, number] | null {
+    const match = wkt?.match(/POINT\s*\(\s*([-0-9.]+)\s+([-0-9.]+)\s*\)/);
+    if (!match) return null;
+    const lon = Number(match[1]);
+    const lat = Number(match[2]);
+    return Number.isFinite(lat) && Number.isFinite(lon) ? [lat, lon] : null;
+}
 
+function flattenRows(rows: RawGdotCameraRow[]): GdotCameraView[] {
+    const out: GdotCameraView[] = [];
+    for (const row of rows) {
+        const point = parsePoint(row.latLng?.geography?.wellKnownText);
+        if (!point) continue;
+        for (const image of row.images ?? []) {
+            if (image.disabled || image.blocked || image.videoDisabled) continue;
+            const viewId = String(image.id ?? "");
+            const videoUrl = image.videoUrl ?? "";
+            if (!viewId || !videoUrl) continue;
+            out.push({
+                siteId: String(row.id ?? ""),
+                viewId,
+                location: row.location ?? image.description ?? "",
+                roadway: row.roadway ?? "",
+                direction: row.direction ?? "",
+                lat: point[0],
+                lon: point[1],
+                imageUrl: new URL(image.imageUrl ?? "", GDOT_BASE_URL).toString(),
+                videoUrl,
+                authRequired: image.isVideoAuthRequired === true,
+            });
+        }
+    }
+    return out;
+}
+
+async function fetchViews(): Promise<GdotCameraView[]> {
+    const views: GdotCameraView[] = [];
+    let total: number | null = null;
+    for (let start = 0; total === null || start < total; start += GDOT_PAGE_SIZE) {
+        const page = await fetchGdotJson<{ recordsTotal: number; data?: RawGdotCameraRow[] }>(
+            cameraListUrl(start),
+        );
+        total ??= page.recordsTotal;
+        const rows = page.data ?? [];
+        if (rows.length === 0) break;
+        views.push(...flattenRows(rows));
+    }
+    return views;
+}
+
+function toFeature(view: GdotCameraView, authSuffix: string): CameraFeature {
+    const stream = view.authRequired && authSuffix ? `${view.videoUrl}${authSuffix}` : view.videoUrl;
     return {
         type: "Feature",
-        geometry: { type: "Point", coordinates: [g.x, g.y] },
+        geometry: { type: "Point", coordinates: [view.lon, view.lat] },
         properties: {
-            stream: a.HLS || a.url || "",
-            hls: a.HLS || null,
+            id: `gdot-${view.viewId}`,
+            stream,
+            streamType: "hls",
+            hls: stream,
             country: "United States",
-            region: `${a.county || ""} County, Georgia`,
-            city: a.subdivision || "Georgia",
+            region: "Georgia",
+            city: "Georgia",
             source: "gdot",
-            name: a.name || "",
-            route: a.route || "",
-            direction: a.dir || "",
-            location_description: a.location_description || "",
+            name: view.location || `GDOT camera ${view.viewId}`,
+            route: view.roadway,
+            direction: view.direction,
+            location_description: view.location,
             categories: ["traffic"],
+            extra: { siteId: view.siteId, viewId: view.viewId, imageUrl: view.imageUrl },
         },
     };
 }
 
-/** Fetch all GDOT cameras, handling ArcGIS pagination. */
 export async function fetchGdotCameras(): Promise<GdotCameraFeature[]> {
-    const all: GdotCameraFeature[] = [];
-    let offset = 0;
-    let hasMore = true;
-
-    while (hasMore) {
-        const params = new URLSearchParams({
-            where: "1=1",
-            outFields: "*",
-            outSR: "4326",
-            f: "json",
-            resultRecordCount: String(PAGE_SIZE),
-            resultOffset: String(offset),
-        });
-
-        const res = await fetch(`${GDOT_BASE}?${params}`, {
-            headers: { "User-Agent": "WorldWideView/1.0" },
-        });
-
-        if (!res.ok) throw new Error(`GDOT API returned ${res.status}`);
-
-        const json = await res.json();
-        const features = json.features || [];
-
-        for (const f of features) {
-            const converted = toGeoJsonFeature(f);
-            if (converted) all.push(converted);
-        }
-
-        hasMore = json.exceededTransferLimit === true;
-        offset += features.length;
-    }
-
-    return all;
+    const views = await fetchViews();
+    const authSuffix = await resolveSharedAuthSuffix(views);
+    return views.map((view) => toFeature(view, authSuffix));
 }
